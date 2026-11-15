@@ -113,12 +113,13 @@ class RefundCredentials extends CredentialStore
 {
     public $enabled = true;
     public $capable = true;
+    public $contractVersion = 1;
     public $project = 'prj_123';
     public function __construct() {}
     public function loadCredentials(): array
     {
         return ['sandbox' => ['project_id' => $this->project, 'capabilities' => $this->capable ? ['invoice_refunds_v1'] : [],
-            'refund_contract_version' => 1, 'refunds_enabled' => $this->enabled]];
+            'refund_contract_version' => $this->contractVersion, 'refunds_enabled' => $this->enabled]];
     }
 }
 

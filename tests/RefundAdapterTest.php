@@ -186,11 +186,11 @@ function test_magento_refund_unknown_reuses_committed_key_and_rejects_mode_switc
 
 function test_magento_refund_guards_prevent_post()
 {
-    foreach (['partial', 'capability', 'disabled', 'boundary', 'draft'] as $case) {
+    foreach (['partial', 'capability', 'contract_version', 'boundary', 'draft'] as $case) {
         list($db, $store, $http, $native, $credentials, $adapter) = magento_refund_fixture();
         if ($case === 'partial') { $native->partial = true; }
         if ($case === 'capability') { $credentials->capable = false; }
-        if ($case === 'disabled') { $credentials->enabled = false; }
+        if ($case === 'contract_version') { $credentials->contractVersion = 2; }
         if ($case === 'boundary') { $native->boundary = false; }
         magento_refund_throws(static function () use ($adapter, $case) {
             $adapter->submit(42, 'full', 'request-full-0001', $case === 'draft' ? ['partial' => true] : []);
@@ -793,4 +793,83 @@ function test_magento_refund_panel_returns_loaded_order_number_and_money()
     assertSameValue('100.0000', $panel['order_amount'], 'Panel exposes precise loaded order amount');
     assertSameValue('USD', $panel['order_currency'], 'Panel exposes loaded order currency');
     assertSameValue(['GET'], array_column($http->requests, 'method'), 'Loading order cannot request a refund');
+}
+
+function test_magento_refund_disabled_snapshot_allows_panel_and_submit_with_valid_contract()
+{
+    list($db, $store, $http, $native, $credentials, $adapter) = magento_refund_fixture();
+    $credentials->enabled = false;
+    $panel = $adapter->panel(42);
+    assertTrueValue($panel['can_overpayment'], 'Panel permits overpayment when Connect contract is valid despite refunds_enabled=false');
+    $intent = $adapter->submit(42, 'full', 'request-disabled-0001', []);
+    assertSameValue('created', $intent->cashState(), 'Submit reaches server POST when refunds_enabled=false and contract is valid');
+    $posts = array_values(array_filter($http->requests, static function ($r) { return $r['method'] === 'POST'; }));
+    assertSameValue(1, count($posts), 'Exactly one POST /v1/refunds issued');
+}
+
+function test_magento_refund_fallback_without_refund_summary_suppresses_completed_overpayment()
+{
+    foreach (['local', 'unbound'] as $source) {
+        list($db, $store, $http, $native, $credentials, $adapter) = magento_refund_fixture();
+        $http->invoice = [
+            'invoice_id' => 'inv_123',
+            'project_id' => 'prj_123',
+            'is_test' => true,
+            'status' => 'paid_over',
+            'order' => ['external_id' => '100000042-0', 'amount' => '100', 'currency' => 'USD'],
+            'payment' => ['paid' => '15.00', 'currency' => 'USDT', 'network' => 'TRC20'],
+        ];
+        $before = $adapter->panel(42);
+        assertTrueValue($before['summary']['can_refund_full'], 'Fallback enables full refund for paid_over invoice');
+        assertTrueValue($before['summary']['can_refund_overpayment'], 'Fallback enables overpayment before prior completion');
+        assertTrueValue($before['can_overpayment'], 'Panel allows overpayment before prior completion');
+        assertSameValue(null, $before['summary']['full_refund_amount'], 'Missing refund_summary never substitutes gross payment.paid for full_refund_amount');
+        assertSameValue(null, $before['summary']['overpayment_refund_amount'], 'Missing refund_summary never substitutes gross payment.paid for overpayment_refund_amount');
+        assertSameValue(['currency' => 'USDT', 'network' => 'TRC20'], $before['summary']['refund_asset'], 'Fallback preserves refund asset');
+
+        if ($source === 'local') {
+            $over = $adapter->submit(42, 'overpayment', 'request-over-fallback1');
+            assertSameValue('created', $over->cashState(), 'First overpayment reaches POST without refund_summary');
+            magento_refund_status($http, $over, 'completed');
+            assertSameValue('apply_completed', $adapter->reconcile($over->operationId()), 'Completed local overpayment applies');
+        } else {
+            $http->withdrawals['wdr_unbound_over'] = [
+                'withdrawal_id' => 'wdr_unbound_over',
+                'invoice_id' => 'inv_123',
+                'project_id' => 'prj_123',
+                'mode' => 'overpayment',
+                'is_test' => true,
+                'external_order_id' => 'dashboard-unbound-over',
+                'status' => 'completed',
+                'amount' => '5.00',
+                'currency' => 'USDT',
+                'network' => 'TRC20',
+                'first_sender' => 'sender-A',
+            ];
+            $adapter->handleEvent(new \Paymos\Webhook\WebhookEvent([
+                'event_type' => 'withdrawal.completed',
+                'data' => [
+                    'withdrawal_id' => 'wdr_unbound_over',
+                    'invoice_id' => 'inv_123',
+                    'project_id' => 'prj_123',
+                    'is_test' => true,
+                    'refund_mode' => 'overpayment',
+                ],
+            ]), 'sandbox');
+        }
+
+        $after = $adapter->panel(42);
+        assertFalseValue($after['summary']['can_refund_overpayment'], 'Completed ' . $source . ' overpayment suppresses repeat overpayment in summary');
+        assertFalseValue($after['can_overpayment'], 'Completed ' . $source . ' overpayment suppresses panel overpayment button');
+        assertTrueValue($after['summary']['can_refund_full'], 'Full refund remains available after completed overpayment');
+        assertSameValue(null, $after['summary']['full_refund_amount'], 'full_refund_amount stays null without refund_summary');
+        assertSameValue(null, $after['summary']['overpayment_refund_amount'], 'overpayment_refund_amount stays null without refund_summary');
+
+        $postsBefore = count(array_filter($http->requests, static function ($r) { return $r['method'] === 'POST'; }));
+        $repeat = $adapter->submit(42, 'overpayment', 'request-over-repeat-01');
+        assertSameValue('review', $repeat->cashState(), 'Preflight refuses second overpayment without refund_summary');
+        assertSameValue('refund_server_action_unavailable', $repeat->toArray()['review_reason'], 'Refusal reason is server action unavailable');
+        $postsAfter = count(array_filter($http->requests, static function ($r) { return $r['method'] === 'POST'; }));
+        assertSameValue($postsBefore, $postsAfter, 'Suppressed repeat overpayment never POSTs to server');
+    }
 }

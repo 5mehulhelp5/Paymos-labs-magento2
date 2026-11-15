@@ -125,7 +125,7 @@ class RefundAdapter implements NativeRefundProjectorInterface
                 || ($invoice['order']['currency'] ?? null) !== $snapshot['currency']) {
                 return 'refund_invoice_mapping_conflict';
             }
-            $summary = $this->invoiceSummary($invoice);
+            $summary = $this->invoiceSummary($invoice, $intent->paymentKey(), $intent->projectId(), $intent->environment());
             $field = $intent->mode() === RefundStates::FULL ? 'can_refund_full' : 'can_refund_overpayment';
             return ($summary[$field] ?? false) === true ? null : 'refund_server_action_unavailable';
         } catch (\Throwable $error) {
@@ -139,9 +139,6 @@ class RefundAdapter implements NativeRefundProjectorInterface
         $config = $credentials[$intent->environment()] ?? [];
         if (!CredentialSet::hasCapability($config, 'invoice_refunds_v1') || ($config['refund_contract_version'] ?? null) !== 1) {
             throw new \RuntimeException('refund_reconnect_required');
-        }
-        if (!CredentialSet::refundsEnabled($config)) {
-            throw new \RuntimeException('refunds_not_enabled');
         }
     }
 
@@ -330,7 +327,7 @@ class RefundAdapter implements NativeRefundProjectorInterface
                 || ($invoice['is_test'] ?? null) !== ($row['environment'] === 'sandbox')) {
                 throw new \RuntimeException('refund_mapping_conflict');
             }
-            $summary = $this->invoiceSummary($invoice);
+            $summary = $this->invoiceSummary($invoice, $key, $row['project_id'], $row['environment']);
             $allowed = true;
             try {
                 $this->store->assertNewActionAllowed($key);
@@ -338,7 +335,7 @@ class RefundAdapter implements NativeRefundProjectorInterface
                 $this->native->assertBoundary(false);
                 $config = $credentials[$row['environment']];
                 $allowed = CredentialSet::hasCapability($config, 'invoice_refunds_v1')
-                    && ($config['refund_contract_version'] ?? null) === 1 && CredentialSet::refundsEnabled($config);
+                    && ($config['refund_contract_version'] ?? null) === 1;
             } catch (\Throwable $error) {
                 $allowed = false;
             }
@@ -356,21 +353,48 @@ class RefundAdapter implements NativeRefundProjectorInterface
         });
     }
 
-    private function invoiceSummary(array $invoice): array
+    private function invoiceSummary(array $invoice, string $paymentKey, string $projectId, string $environment): array
     {
         if (array_key_exists('refund_summary', $invoice)) {
             return is_array($invoice['refund_summary']) ? $invoice['refund_summary'] : [];
         }
         $status = isset($invoice['status']) && is_string($invoice['status']) ? $invoice['status'] : '';
         $payment = isset($invoice['payment']) && is_array($invoice['payment']) ? $invoice['payment'] : [];
-        $paid = in_array($status, ['paid', 'paid_over'], true);
-        $overpaid = $status === 'paid_over';
+        $invoiceId = isset($invoice['invoice_id']) && is_string($invoice['invoice_id']) ? $invoice['invoice_id'] : '';
+        $completedOverpayment = false;
+        foreach ($this->store->forPayment($paymentKey) as $prior) {
+            $observation = $prior->observation();
+            if ($prior->invoiceId() === $invoiceId
+                && $prior->projectId() === $projectId
+                && $prior->environment() === $environment
+                && $prior->mode() === RefundStates::OVERPAYMENT
+                && ($prior->cashState() === RefundStates::COMPLETED
+                    || ($observation !== null && $observation->status() === 'completed'))) {
+                $completedOverpayment = true;
+                break;
+            }
+        }
+        if (!$completedOverpayment) {
+            foreach ($this->store->unboundForPayment($paymentKey) as $row) {
+                $refund = VerifiedRefund::fromStorage(json_decode($row['payload'], true, 512, JSON_THROW_ON_ERROR));
+                if ($refund->invoiceId() === $invoiceId
+                    && $refund->projectId() === $projectId
+                    && $refund->environment() === $environment
+                    && $refund->mode() === RefundStates::OVERPAYMENT
+                    && $refund->status() === 'completed') {
+                    $completedOverpayment = true;
+                    break;
+                }
+            }
+        }
         return [
-            'can_refund_full' => $paid,
-            'can_refund_overpayment' => $overpaid,
-            'full_refund_amount' => isset($payment['paid']) && is_string($payment['paid']) ? $payment['paid'] : ($paid ? (string) ($invoice['order']['amount'] ?? '0') : '0'),
-            'overpayment_refund_amount' => $overpaid && isset($payment['paid']) && is_string($payment['paid']) ? $payment['paid'] : '0',
-            'refund_asset' => isset($payment['currency'], $payment['network'])
+            'can_refund_full' => in_array($status, ['paid', 'paid_over'], true),
+            'can_refund_overpayment' => $status === 'paid_over' && !$completedOverpayment,
+            // Gross does not establish the remaining cash after earlier refunds.
+            'full_refund_amount' => null,
+            'overpayment_refund_amount' => null,
+            'refund_asset' => (isset($payment['currency'], $payment['network'])
+                && is_string($payment['currency']) && is_string($payment['network']))
                 ? ['currency' => $payment['currency'], 'network' => $payment['network']] : null,
         ];
     }

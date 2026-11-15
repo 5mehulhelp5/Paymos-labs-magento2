@@ -6,6 +6,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.10] - 2026-11-15
+
+- fix(refunds): decouple refund RBAC from Withdraw and unify 12 CMS refund adapters
+- chore: rebuild canonical CMS package
+
 ## [1.11.9] - 2026-11-14
 
 - chore: rebuild canonical CMS package
