@@ -7,6 +7,7 @@ namespace Paymos\Payment\Service;
 use Paymos\Client;
 use Paymos\Exception\NotFoundException;
 use Paymos\Plugin\AmountGuard;
+use Paymos\Plugin\InvoicePresentation;
 use Paymos\Plugin\InvoiceRenewal;
 use Paymos\Plugin\InvoiceReplacement;
 use Paymos\Plugin\InvoiceReplacementBlockedException;
@@ -48,7 +49,7 @@ class CheckoutProcessor
     }
 
     /**
-     * @param array{order_id:int, increment_id:string, amount:string, currency:string, customer_id?:int|string|null} $order
+     * @param array{order_id:int, increment_id:string, amount:string, currency:string, customer_id?:int|string|null, products?:array<int, array<string, mixed>>} $order
      * @param string $environment sandbox|live (the admin mode)
      * @return array{invoice_id:string, payment_url:string, reused:bool}
      */
@@ -95,6 +96,11 @@ class CheckoutProcessor
         $clientId = $this->clientId($order);
         if ($clientId !== '') {
             $payload['client_id'] = $clientId;
+        }
+
+        $products = $this->normalizeProducts($order);
+        if ($products !== null) {
+            $payload['products'] = $products;
         }
 
         $response = $this->client($environment)->invoices()->create($payload);
@@ -258,6 +264,81 @@ class CheckoutProcessor
             throw new \InvalidArgumentException('Magento order amount must be a positive decimal.');
         }
         return $normalized;
+    }
+
+    /**
+     * @param array<string, mixed> $order
+     * @return array<int, array<string, mixed>>|null
+     */
+    private function normalizeProducts(array $order): ?array
+    {
+        if (!isset($order['products']) || !is_iterable($order['products'])) {
+            return null;
+        }
+        if (!class_exists(InvoicePresentation::class)
+            || !method_exists(InvoicePresentation::class, 'normalizeProducts')
+        ) {
+            return null;
+        }
+
+        $candidates = [];
+        foreach ($order['products'] as $candidate) {
+            if (!is_array($candidate)) {
+                return null;
+            }
+            $candidates[] = $this->prepareProductCandidate($candidate);
+        }
+
+        return InvoicePresentation::normalizeProducts($candidates);
+    }
+
+    /**
+     * @param array<string, mixed> $candidate
+     * @return array<string, mixed>
+     */
+    private function prepareProductCandidate(array $candidate): array
+    {
+        return [
+            'title' => isset($candidate['title']) && is_string($candidate['title'])
+                ? $candidate['title']
+                : null,
+            'description' => isset($candidate['description']) && is_string($candidate['description'])
+                ? $candidate['description']
+                : null,
+            'image_url' => isset($candidate['image_url']) && is_string($candidate['image_url'])
+                ? $candidate['image_url']
+                : null,
+            'quantity' => array_key_exists('quantity', $candidate) ? $candidate['quantity'] : null,
+            'unit_amount' => array_key_exists('unit_amount', $candidate)
+                ? $this->normalizeUnitAmountInput($candidate['unit_amount'])
+                : null,
+        ];
+    }
+
+    /**
+     * @param mixed $unitAmount
+     */
+    private function normalizeUnitAmountInput($unitAmount): ?string
+    {
+        if (is_string($unitAmount)) {
+            return $unitAmount;
+        }
+        if (is_int($unitAmount)) {
+            return (string) $unitAmount;
+        }
+        if (is_float($unitAmount) && is_finite($unitAmount)) {
+            $str = (string) $unitAmount;
+            if (stripos($str, 'e') === false) {
+                return $str;
+            }
+            if (abs($unitAmount) < 1.0) {
+                $formatted = rtrim(rtrim(sprintf('%.18F', $unitAmount), '0'), '.');
+                return $formatted === '-0' ? '0' : $formatted;
+            }
+            return number_format($unitAmount, 0, '.', '');
+        }
+
+        return null;
     }
 
     /**

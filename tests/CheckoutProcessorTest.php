@@ -327,3 +327,459 @@ function test_magento_checkout_cancels_the_old_invoice_in_its_own_environment()
     assertSameValue(array('cancel inv_123'), \Paymos\Payment\Tests\paymos_m2_calls($sandbox), 'the sandbox invoice is cancelled with sandbox credentials.');
     assertSameValue(array('create'), \Paymos\Payment\Tests\paymos_m2_calls($live), 'only the create goes to live.');
 }
+
+function test_magento_checkout_sends_single_product_and_omits_optional_fields()
+{
+    $config = Config::fromArray(paymos_m2_generated_config());
+    $snapshots = new InMemorySnapshotRepository();
+    $invoices = new FakeInvoices();
+    $processor = new CheckoutProcessor($config, $snapshots, static function () use ($invoices) {
+        return new FakeClient($invoices);
+    });
+
+    $processor->start(array(
+        'order_id' => 42,
+        'increment_id' => '100000042',
+        'amount' => '47.00',
+        'currency' => 'USD',
+        'customer_id' => 77,
+        'products' => array(
+            array(
+                'title' => '<b>Canvas</b> &amp; Blue',
+                'description' => '<p>Archival print</p>',
+                'image_url' => 'https://shop.example/media/catalog/product/c/a/canvas.webp',
+                'quantity' => 2,
+                'unit_amount' => '24.50',
+            ),
+        ),
+    ), 'sandbox');
+
+    $payload = $invoices->createPayloads[0];
+    assertSameValue('47', $payload['amount'], 'Native grand total must never be replaced by sum(qty * unit_amount).');
+    assertSameValue(
+        array(
+            array(
+                'title' => 'Canvas & Blue',
+                'quantity' => 2,
+                'unit_amount' => '24.50',
+                'description' => 'Archival print',
+                'image_url' => 'https://shop.example/media/catalog/product/c/a/canvas.webp',
+            ),
+        ),
+        $payload['products'],
+        'Single valid product must be normalized and sent.'
+    );
+
+    $minimalInvoices = new FakeInvoices();
+    $minimalProcessor = new CheckoutProcessor($config, new InMemorySnapshotRepository(), static function () use ($minimalInvoices) {
+        return new FakeClient($minimalInvoices);
+    });
+    $minimalProcessor->start(array(
+        'order_id' => 43,
+        'increment_id' => '100000043',
+        'amount' => '12.00',
+        'currency' => 'USD',
+        'products' => array(
+            array(
+                'title' => 'Priority Support',
+                'description' => "<p>&nbsp;\xc2\xa0</p>",
+                'image_url' => 'http://shop.example/insecure.png',
+                'quantity' => '1',
+                'unit_amount' => '12.00',
+            ),
+        ),
+    ), 'sandbox');
+
+    assertSameValue(
+        array(
+            array(
+                'title' => 'Priority Support',
+                'quantity' => 1,
+                'unit_amount' => '12.00',
+            ),
+        ),
+        $minimalInvoices->createPayloads[0]['products'],
+        'Blank description and non-HTTPS image_url must be omitted per item without rejecting the product.'
+    );
+}
+
+function test_magento_checkout_sends_cart_and_falls_back_all_or_nothing()
+{
+    $config = Config::fromArray(paymos_m2_generated_config());
+
+    $invoices = new FakeInvoices();
+    $processor = new CheckoutProcessor($config, new InMemorySnapshotRepository(), static function () use ($invoices) {
+        return new FakeClient($invoices);
+    });
+    $processor->start(array(
+        'order_id' => 44,
+        'increment_id' => '100000044',
+        'amount' => '42.50',
+        'currency' => 'USD',
+        'products' => array(
+            array(
+                'title' => 'Canvas',
+                'description' => 'Signed print',
+                'image_url' => 'https://shop.example/canvas.png',
+                'quantity' => 2,
+                'unit_amount' => '15.00',
+            ),
+            array(
+                'title' => 'Notebook',
+                'description' => null,
+                'image_url' => null,
+                'quantity' => 1,
+                'unit_amount' => '12.50',
+            ),
+        ),
+    ), 'sandbox');
+
+    assertSameValue('42.5', $invoices->createPayloads[0]['amount'], 'Grand total with shipping/discount/tax must be preserved.');
+    assertSameValue(2, count($invoices->createPayloads[0]['products']), 'Multi-item cart must preserve all items.');
+    assertFalseValue(array_key_exists('description', $invoices->createPayloads[0]['products'][1]), 'Missing description must be omitted.');
+    assertFalseValue(array_key_exists('image_url', $invoices->createPayloads[0]['products'][1]), 'Missing image_url must be omitted.');
+
+    $fifty = array();
+    for ($i = 1; $i <= 50; $i++) {
+        $fifty[] = array('title' => 'Item ' . $i, 'quantity' => 1, 'unit_amount' => 1.25);
+    }
+    $fiftyInvoices = new FakeInvoices();
+    $fiftyProcessor = new CheckoutProcessor($config, new InMemorySnapshotRepository(), static function () use ($fiftyInvoices) {
+        return new FakeClient($fiftyInvoices);
+    });
+    $fiftyProcessor->start(array(
+        'order_id' => 45,
+        'increment_id' => '100000045',
+        'amount' => '62.50',
+        'currency' => 'USD',
+        'products' => $fifty,
+    ), 'sandbox');
+    assertSameValue(50, count($fiftyInvoices->createPayloads[0]['products']), 'Exactly 50 items must be sent.');
+    assertSameValue('1.25', $fiftyInvoices->createPayloads[0]['products'][0]['unit_amount'], 'Numeric unit_amount must convert to decimal string.');
+
+    $fiftyOne = $fifty;
+    $fiftyOne[] = array('title' => 'Item 51', 'quantity' => 1, 'unit_amount' => '1.25');
+
+    $fallbackCases = array(
+        'empty' => array(),
+        'over_50' => $fiftyOne,
+        'fractional_qty' => array(
+            array('title' => 'Valid Shirt', 'quantity' => 1, 'unit_amount' => '20.00'),
+            array('title' => 'Fabric', 'quantity' => 1.5, 'unit_amount' => '10.00'),
+        ),
+        'blank_title' => array(
+            array('title' => 'Valid Shirt', 'quantity' => 1, 'unit_amount' => '20.00'),
+            array('title' => '<b>&nbsp;</b>', 'quantity' => 1, 'unit_amount' => '10.00'),
+        ),
+        'negative_unit_amount' => array(
+            array('title' => 'Valid Shirt', 'quantity' => 1, 'unit_amount' => '20.00'),
+            array('title' => 'Adjustment', 'quantity' => 1, 'unit_amount' => '-5.00'),
+        ),
+        'non_array_row' => array(
+            array('title' => 'Valid Shirt', 'quantity' => 1, 'unit_amount' => '20.00'),
+            'not-an-item',
+        ),
+    );
+
+    foreach ($fallbackCases as $label => $badProducts) {
+        $fallbackInvoices = new FakeInvoices();
+        $fallbackProcessor = new CheckoutProcessor($config, new InMemorySnapshotRepository(), static function () use ($fallbackInvoices) {
+            return new FakeClient($fallbackInvoices);
+        });
+        $fallbackProcessor->start(array(
+            'order_id' => 46,
+            'increment_id' => '100000046',
+            'amount' => '30.00',
+            'currency' => 'USD',
+            'products' => $badProducts,
+        ), 'sandbox');
+
+        assertFalseValue(
+            array_key_exists('products', $fallbackInvoices->createPayloads[0]),
+            $label . ': invalid or out-of-range carts must fall back all-or-nothing to amount-only.'
+        );
+        assertSameValue('30', $fallbackInvoices->createPayloads[0]['amount'], $label . ': grand total remains intact.');
+    }
+}
+
+function test_magento_checkout_retry_ignores_presentation_metadata_differences()
+{
+    $config = Config::fromArray(paymos_m2_generated_config());
+    $snapshots = new InMemorySnapshotRepository();
+    $invoices = new FakeInvoices(array(), array('invoice_id' => 'inv_123', 'status' => 'awaiting_client'));
+    $processor = new CheckoutProcessor($config, $snapshots, static function () use ($invoices) {
+        return new FakeClient($invoices);
+    });
+
+    $first = $processor->start(array(
+        'order_id' => 42,
+        'increment_id' => '100000042',
+        'amount' => '100.00',
+        'currency' => 'USD',
+        'customer_id' => 77,
+        'products' => array(
+            array(
+                'title' => 'Studio Pro',
+                'description' => 'Version A',
+                'image_url' => 'https://shop.example/a.png',
+                'quantity' => 2,
+                'unit_amount' => '50.00',
+            ),
+        ),
+    ), 'sandbox');
+
+    $second = $processor->start(array(
+        'order_id' => 42,
+        'increment_id' => '100000042',
+        'amount' => '100.00',
+        'currency' => 'USD',
+        'customer_id' => 77,
+        'products' => array(
+            array(
+                'title' => 'Studio Pro Updated',
+                'description' => 'Version B',
+                'image_url' => null,
+                'quantity' => 1,
+                'unit_amount' => '100.00',
+            ),
+        ),
+    ), 'sandbox');
+
+    assertFalseValue($first['reused'], 'First call creates the invoice.');
+    assertTrueValue($second['reused'], 'Changed presentation metadata with unchanged money must reuse the invoice.');
+    assertSameValue(array('create', 'get inv_123'), \Paymos\Payment\Tests\paymos_m2_calls($invoices), 'No cancel or second create when only presentation metadata changed.');
+    assertSameValue(1, count($invoices->createPayloads), 'Only the initial invoice was created.');
+
+    // Changing money still cancels and renews with the latest products.
+    $renewed = $processor->start(array(
+        'order_id' => 42,
+        'increment_id' => '100000042',
+        'amount' => '120.00',
+        'currency' => 'USD',
+        'customer_id' => 77,
+        'products' => array(
+            array(
+                'title' => 'Studio Pro Updated',
+                'quantity' => 1,
+                'unit_amount' => '120.00',
+            ),
+        ),
+    ), 'sandbox');
+
+    assertFalseValue($renewed['reused'], 'Changed amount must create a fresh invoice.');
+    assertSameValue('100000042-1', $invoices->createPayloads[1]['external_order_id'], 'Renewed invoice bumps external_order_id.');
+    assertSameValue('Studio Pro Updated', $invoices->createPayloads[1]['products'][0]['title'], 'Renewed invoice sends current products.');
+
+    // Lost create response retry returning an already-paid invoice with products[] remains applicable.
+    $replaySnapshots = new InMemorySnapshotRepository();
+    $replayInvoices = new FakeInvoices(array(
+        'invoice_id' => 'inv_paid',
+        'payment_url' => 'https://paymos.test/pay/inv_paid',
+        'status' => 'paid',
+    ));
+    (new CheckoutProcessor($config, $replaySnapshots, static function () use ($replayInvoices) {
+        return new FakeClient($replayInvoices);
+    }))->start(array(
+        'order_id' => 47,
+        'increment_id' => '100000047',
+        'amount' => '100.00',
+        'currency' => 'USD',
+        'products' => array(
+            array('title' => 'Studio Pro', 'quantity' => 2, 'unit_amount' => '50.00'),
+        ),
+    ), 'sandbox');
+    assertSameValue('awaiting_client', $replaySnapshots->rows[0]['status'], 'Recovered paid create with products[] stays applicable for OrderMapper.');
+    assertSameValue('100', $replaySnapshots->rows[0]['amount'], 'Snapshot keeps canonical amount.');
+}
+
+function test_magento_redirect_extracts_visible_items_and_handles_fractional_fallback()
+{
+    $makeOrder = static function (array $items, string $grandTotal, string $mediaBase = 'https://shop.example/media/') {
+        return new class($items, $grandTotal, $mediaBase) extends \Magento\Sales\Model\Order {
+            /** @var array<int, object> */
+            private $items;
+            /** @var string */
+            private $grandTotal;
+            /** @var string */
+            private $mediaBase;
+
+            public function __construct(array $items, string $grandTotal, string $mediaBase)
+            {
+                $this->items = $items;
+                $this->grandTotal = $grandTotal;
+                $this->mediaBase = $mediaBase;
+            }
+
+            public function reset() { return $this; }
+            public function getResource() { return $this; }
+            public function load($order, $id) { return $this; }
+            public function getState() { return 'new'; }
+            public function getTotalPaid() { return '0'; }
+            public function getTotalRefunded() { return '0'; }
+            public function getId() { return 42; }
+            public function getEntityId() { return 42; }
+            public function getIncrementId() { return '100000042'; }
+            public function getGrandTotal() { return $this->grandTotal; }
+            public function getOrderCurrencyCode() { return 'USD'; }
+            public function getCustomerId() { return 77; }
+            public function getStoreId() { return 1; }
+            public function getStatus() { return 'pending'; }
+            public function setStatus($status) { return $this; }
+            public function addCommentToStatusHistory($comment, $status = false) { return $this; }
+            public function save() { return $this; }
+            public function getAllVisibleItems() { return $this->items; }
+            public function getStore()
+            {
+                $mediaBase = $this->mediaBase;
+                return new class($mediaBase) {
+                    private $mediaBase;
+                    public function __construct(string $mediaBase) { $this->mediaBase = $mediaBase; }
+                    public function getBaseUrl($type = 'link') { return $this->mediaBase; }
+                };
+            }
+        };
+    };
+
+    $makeItem = static function (array $spec) {
+        return new class($spec) {
+            /** @var array<string, mixed> */
+            private $spec;
+            public function __construct(array $spec) { $this->spec = $spec; }
+            public function isDeleted() { return !empty($this->spec['deleted']); }
+            public function getParentItemId() { return $this->spec['parent_item_id'] ?? null; }
+            public function getName() { return $this->spec['name'] ?? null; }
+            public function getProductOptions() { return $this->spec['options'] ?? null; }
+            public function getDescription() { return $this->spec['description'] ?? null; }
+            public function getQtyOrdered() { return $this->spec['qty'] ?? null; }
+            public function getPrice() { return $this->spec['price'] ?? null; }
+            public function getProductType() { return $this->spec['product_type'] ?? 'simple'; }
+            public function getChildrenItems() { return $this->spec['children'] ?? array(); }
+            public function getProduct()
+            {
+                if (!empty($this->spec['deleted_product'])) {
+                    return null;
+                }
+                $image = $this->spec['image'] ?? null;
+                $shortDesc = $this->spec['short_description'] ?? null;
+                return new class($image, $shortDesc) {
+                    private $image;
+                    private $shortDesc;
+                    public function __construct($image, $shortDesc)
+                    {
+                        $this->image = $image;
+                        $this->shortDesc = $shortDesc;
+                    }
+                    public function getImage() { return $this->image; }
+                    public function getShortDescription() { return $this->shortDesc; }
+                };
+            }
+        };
+    };
+
+    $runRedirect = static function ($order, FakeInvoices $invoices) {
+        $session = new class($order) extends \Magento\Checkout\Model\Session {
+            private $order;
+            public function __construct($order) { $this->order = $order; }
+            public function getLastRealOrder() { return $this->order; }
+        };
+        $messages = new class implements \Magento\Framework\Message\ManagerInterface {
+            public $errors = array();
+            public function addErrorMessage($message, $group = null) { $this->errors[] = (string) $message; return $this; }
+        };
+        $snapshots = new class(new InMemorySnapshotRepository()) extends \Paymos\Payment\Service\InvoiceSnapshotRepository {
+            public $inner;
+            public function __construct(InMemorySnapshotRepository $inner) { $this->inner = $inner; }
+            public function synchronized(int $orderId, callable $action) { return $this->inner->synchronized($orderId, $action); }
+            public function assertLocked(int $orderId): void { $this->inner->assertLocked($orderId); }
+            public function save(array $row): void { $this->inner->save($row); }
+            public function findByExternalOrderId(string $externalOrderId) { return $this->inner->findByExternalOrderId($externalOrderId); }
+            public function findByOrderId(int $orderId) { return $this->inner->findByOrderId($orderId); }
+            public function updateStatus(string $paymosInvoiceId, string $status): void { $this->inner->updateStatus($paymosInvoiceId, $status); }
+            public function findUnpaidRecent(int $limit, int $createdAfterUnix): array { return $this->inner->findUnpaidRecent($limit, $createdAfterUnix); }
+        };
+        $configProvider = new class extends \Paymos\Payment\Service\GeneratedConfigProvider {
+            public function __construct() {}
+            public function get(): Config { return Config::fromArray(paymos_m2_generated_config()); }
+        };
+        $clientFactory = new class($invoices) extends \Paymos\Payment\Service\PaymosClientFactory {
+            private $invoices;
+            public function __construct(FakeInvoices $invoices) { $this->invoices = $invoices; }
+            public function asCallable(): callable
+            {
+                $invoices = $this->invoices;
+                return static function () use ($invoices) { return new FakeClient($invoices); };
+            }
+        };
+
+        $controller = new \Paymos\Payment\Controller\Payment\Redirect(
+            new \Magento\Framework\Controller\ResultFactory(),
+            $session,
+            $configProvider,
+            $snapshots,
+            $clientFactory,
+            paymos_m2_settings(),
+            $messages,
+            new \Paymos\Payment\Service\Logger()
+        );
+
+        return $controller->execute();
+    };
+
+    $invoices = new FakeInvoices();
+    $order = $makeOrder(array(
+        $makeItem(array(
+            'name' => 'Canvas',
+            'product_type' => 'configurable',
+            'options' => array('attributes_info' => array(array('label' => 'Color', 'value' => 'Blue'))),
+            'short_description' => '<p>Giclée print</p>',
+            'children' => array($makeItem(array('image' => '/c/a/canvas-blue.webp'))),
+            'qty' => '2.0000',
+            'price' => '24.5000',
+        )),
+        $makeItem(array(
+            'name' => 'Deleted Catalog Item',
+            'deleted_product' => true,
+            'qty' => '1.0000',
+            'price' => '10.0000',
+        )),
+        $makeItem(array(
+            'name' => 'Hidden Child Row',
+            'parent_item_id' => 1,
+            'qty' => '2.0000',
+            'price' => '0.0000',
+        )),
+    ), '47.0000');
+
+    $redirect = $runRedirect($order, $invoices);
+    assertSameValue('https://paymos.test/pay/inv_123', $redirect->url, 'Redirect must send buyer to Paymos invoice.');
+    $payload = $invoices->createPayloads[0];
+    assertSameValue('47', $payload['amount'], 'Grand total comes from Magento order grand total.');
+    assertSameValue(
+        array(
+            array(
+                'title' => 'Canvas · Blue',
+                'quantity' => 2,
+                'unit_amount' => '24.50',
+                'description' => 'Giclée print',
+                'image_url' => 'https://shop.example/media/catalog/product/c/a/canvas-blue.webp',
+            ),
+            array(
+                'title' => 'Deleted Catalog Item',
+                'quantity' => 1,
+                'unit_amount' => '10.00',
+            ),
+        ),
+        $payload['products'],
+        'Magento Redirect must extract visible items with DECIMAL(12,4) qty and DECIMAL(20,4) price, excluding child rows.'
+    );
+
+    // Fractional qty_ordered in any visible line triggers all-or-nothing amount-only fallback.
+    $fractionalInvoices = new FakeInvoices();
+    $fractionalOrder = $makeOrder(array(
+        $makeItem(array('name' => 'Shirt', 'qty' => '1.0000', 'price' => '20.0000')),
+        $makeItem(array('name' => 'Fabric', 'qty' => '1.5000', 'price' => '10.0000')),
+    ), '35.0000');
+    $runRedirect($fractionalOrder, $fractionalInvoices);
+    assertFalseValue(array_key_exists('products', $fractionalInvoices->createPayloads[0]), 'Fractional qty_ordered must fall back to amount-only.');
+    assertSameValue('35', $fractionalInvoices->createPayloads[0]['amount'], 'Fallback preserves Magento grand total.');
+}

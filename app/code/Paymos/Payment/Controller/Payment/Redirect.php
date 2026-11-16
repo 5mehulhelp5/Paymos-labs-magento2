@@ -8,6 +8,7 @@ use Magento\Checkout\Model\Session as CheckoutSession;
 use Magento\Framework\App\Action\HttpGetActionInterface;
 use Magento\Framework\Controller\Result\Redirect as RedirectResult;
 use Magento\Framework\Controller\ResultFactory;
+use Magento\Framework\UrlInterface;
 use Magento\Sales\Model\Order;
 use Paymos\Exception\ApiException;
 use Paymos\Payment\Service\CheckoutProcessor;
@@ -16,6 +17,7 @@ use Paymos\Payment\Service\InvoiceSnapshotRepository;
 use Paymos\Payment\Service\Logger;
 use Paymos\Payment\Service\PaymosClientFactory;
 use Paymos\Payment\Service\Settings;
+use Paymos\Plugin\AmountGuard;
 
 /**
  * Creates the Paymos invoice for the just-placed order and redirects the
@@ -120,13 +122,19 @@ class Redirect implements HttpGetActionInterface
                 $this->clientFactory->asCallable()
             );
 
-            $result = $processor->start([
+            $orderPayload = [
                 'order_id' => (int) $order->getEntityId(),
                 'increment_id' => (string) $order->getIncrementId(),
                 'amount' => (string) $order->getGrandTotal(),
                 'currency' => (string) $order->getOrderCurrencyCode(),
                 'customer_id' => $order->getCustomerId(),
-            ], $environment);
+            ];
+            $products = $this->extractProducts($order);
+            if ($products !== []) {
+                $orderPayload['products'] = $products;
+            }
+
+            $result = $processor->start($orderPayload, $environment);
 
             $this->snapshots->assertLocked((int) $order->getEntityId());
             if ($this->reloadAndHasPayment($order)) { return $redirect->setPath('checkout/onepage/success'); }
@@ -227,5 +235,292 @@ class Redirect implements HttpGetActionInterface
                 'error' => $e->getMessage(),
             ]);
         }
+    }
+
+    /**
+     * Extract native visible product line items for Paymos invoice presentation.
+     *
+     * Shipping, tax, and order-level discounts live on the Magento order rather
+     * than sales_order_item; composite child rows are excluded by getAllVisibleItems().
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function extractProducts(Order $order): array
+    {
+        if (method_exists($order, 'getAllVisibleItems')) {
+            $rawItems = $order->getAllVisibleItems();
+        } elseif (method_exists($order, 'getAllItems')) {
+            $rawItems = $order->getAllItems();
+        } else {
+            return [];
+        }
+
+        if (!is_iterable($rawItems)) {
+            return [];
+        }
+
+        $products = [];
+        foreach ($rawItems as $item) {
+            if (!is_object($item)) {
+                continue;
+            }
+            if (method_exists($item, 'isDeleted') && $item->isDeleted()) {
+                continue;
+            }
+            if (method_exists($item, 'getParentItemId') && $item->getParentItemId()) {
+                continue;
+            }
+
+            $products[] = [
+                'title' => $this->extractItemTitle($item),
+                'description' => $this->extractItemDescription($item),
+                'image_url' => $this->extractItemImageUrl($order, $item),
+                'quantity' => $this->extractItemQuantity($item),
+                'unit_amount' => $this->extractItemUnitAmount($item),
+            ];
+        }
+
+        return $products;
+    }
+
+    /**
+     * @param object $item
+     */
+    private function extractItemTitle($item): ?string
+    {
+        $name = method_exists($item, 'getName') ? $item->getName() : null;
+        if (!is_string($name)) {
+            return null;
+        }
+        if (trim($name) === '') {
+            return $name;
+        }
+
+        $options = method_exists($item, 'getProductOptions') ? $item->getProductOptions() : null;
+        if (!is_array($options)) {
+            return $name;
+        }
+
+        $suffixes = [];
+        foreach (['attributes_info', 'options'] as $group) {
+            if (!isset($options[$group]) || !is_array($options[$group])) {
+                continue;
+            }
+            foreach ($options[$group] as $option) {
+                if (!is_array($option)) {
+                    continue;
+                }
+                $rawVal = $option['print_value'] ?? ($option['value'] ?? null);
+                if (!is_scalar($rawVal)) {
+                    continue;
+                }
+                $val = trim((string) $rawVal);
+                if ($val !== '' && stripos($name, $val) === false && !in_array($val, $suffixes, true)) {
+                    $suffixes[] = $val;
+                }
+            }
+        }
+
+        return $suffixes === [] ? $name : $name . ' · ' . implode(' · ', $suffixes);
+    }
+
+    /**
+     * @param object $item
+     */
+    private function extractItemDescription($item): ?string
+    {
+        $description = method_exists($item, 'getDescription') ? $item->getDescription() : null;
+        if (is_string($description) && trim($description) !== '') {
+            return $description;
+        }
+
+        $product = $this->safeItemProduct($item);
+        if ($product === null) {
+            return null;
+        }
+
+        foreach (['getShortDescription', 'getDescription'] as $getter) {
+            if (method_exists($product, $getter)) {
+                $val = $product->$getter();
+                if (is_string($val) && trim($val) !== '') {
+                    return $val;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param object $item
+     */
+    private function extractItemImageUrl(Order $order, $item): ?string
+    {
+        $imagePath = null;
+        $productType = method_exists($item, 'getProductType') ? (string) $item->getProductType() : '';
+        if ($productType === 'configurable' && method_exists($item, 'getChildrenItems')) {
+            $children = $item->getChildrenItems();
+            if (is_iterable($children)) {
+                foreach ($children as $child) {
+                    if (!is_object($child)) {
+                        continue;
+                    }
+                    $childImage = $this->productImagePath($this->safeItemProduct($child));
+                    if ($childImage !== null) {
+                        $imagePath = $childImage;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if ($imagePath === null) {
+            $imagePath = $this->productImagePath($this->safeItemProduct($item));
+        }
+
+        if ($imagePath === null) {
+            return null;
+        }
+
+        if (preg_match('/\Ahttps?:\/\//i', $imagePath) === 1) {
+            return $imagePath;
+        }
+
+        $mediaBase = $this->resolveMediaBaseUrl($order);
+        if ($mediaBase === '') {
+            return null;
+        }
+
+        return $mediaBase . '/catalog/product/' . ltrim($imagePath, '/');
+    }
+
+    /**
+     * @param object|null $product
+     */
+    private function productImagePath($product): ?string
+    {
+        if ($product === null) {
+            return null;
+        }
+
+        foreach (['getImage', 'getSmallImage', 'getThumbnail'] as $getter) {
+            if (method_exists($product, $getter)) {
+                $val = $product->$getter();
+                if (is_string($val)) {
+                    $trimmed = trim($val);
+                    if ($trimmed !== '' && $trimmed !== 'no_selection') {
+                        return $trimmed;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function resolveMediaBaseUrl(Order $order): string
+    {
+        if (!method_exists($order, 'getStore')) {
+            return '';
+        }
+        try {
+            $store = $order->getStore();
+            if (!is_object($store) || !method_exists($store, 'getBaseUrl')) {
+                return '';
+            }
+            $mediaType = defined(UrlInterface::class . '::URL_TYPE_MEDIA') ? UrlInterface::URL_TYPE_MEDIA : 'media';
+            $base = $store->getBaseUrl($mediaType);
+            return is_string($base) ? rtrim(trim($base), '/') : '';
+        } catch (\Throwable $e) {
+            $this->logger->warning('Paymos could not resolve store media base URL.', [
+                'error' => $e->getMessage(),
+            ]);
+            return '';
+        }
+    }
+
+    /**
+     * @param object $item
+     * @return object|null
+     */
+    private function safeItemProduct($item)
+    {
+        if (!method_exists($item, 'getProduct')) {
+            return null;
+        }
+        try {
+            $product = $item->getProduct();
+            return is_object($product) ? $product : null;
+        } catch (\Throwable $e) {
+            $this->logger->warning('Paymos could not load product presentation metadata.', [
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * @param object $item
+     * @return int|string|null
+     */
+    private function extractItemQuantity($item)
+    {
+        if (!method_exists($item, 'getQtyOrdered')) {
+            return null;
+        }
+        $rawQty = $item->getQtyOrdered();
+        if (is_int($rawQty)) {
+            return $rawQty;
+        }
+        if (is_float($rawQty)) {
+            $normalized = AmountGuard::normalizeDecimal($rawQty);
+            return $normalized !== null ? $normalized : $rawQty;
+        }
+        if (is_string($rawQty)) {
+            $trimmed = trim($rawQty);
+            // Magento DECIMAL(12,4) columns return strings like "2.0000" for whole quantities.
+            if (preg_match('/\A(?:0|[1-9][0-9]*)\.[0-9]+\z/', $trimmed) === 1) {
+                $normalized = AmountGuard::normalizeDecimal($trimmed);
+                return $normalized !== null ? $normalized : $rawQty;
+            }
+            return $rawQty;
+        }
+
+        return null;
+    }
+
+    /**
+     * @param object $item
+     */
+    private function extractItemUnitAmount($item): ?string
+    {
+        if (!method_exists($item, 'getPrice')) {
+            return null;
+        }
+        $rawPrice = $item->getPrice();
+        if (is_int($rawPrice)) {
+            return (string) $rawPrice;
+        }
+        if (is_float($rawPrice) && is_finite($rawPrice)) {
+            $str = (string) $rawPrice;
+            if (stripos($str, 'e') === false) {
+                return $str;
+            }
+            if (abs($rawPrice) < 1.0) {
+                $formatted = rtrim(rtrim(sprintf('%.18F', $rawPrice), '0'), '.');
+                return $formatted === '-0' ? '0' : $formatted;
+            }
+            return number_format($rawPrice, 0, '.', '');
+        }
+        if (is_string($rawPrice)) {
+            $trimmed = trim($rawPrice);
+            if (preg_match('/\A(?:0|[1-9][0-9]*)\.[0-9]{2}([0-9]+)\z/', $trimmed, $matches) === 1) {
+                $head = substr($trimmed, 0, strlen($trimmed) - strlen($matches[1]));
+                return $head . rtrim($matches[1], '0');
+            }
+            return $trimmed;
+        }
+
+        return null;
     }
 }
