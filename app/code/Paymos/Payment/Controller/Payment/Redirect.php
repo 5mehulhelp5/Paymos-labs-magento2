@@ -8,7 +8,6 @@ use Magento\Checkout\Model\Session as CheckoutSession;
 use Magento\Framework\App\Action\HttpGetActionInterface;
 use Magento\Framework\Controller\Result\Redirect as RedirectResult;
 use Magento\Framework\Controller\ResultFactory;
-use Magento\Framework\UrlInterface;
 use Magento\Sales\Model\Order;
 use Paymos\Exception\ApiException;
 use Paymos\Payment\Service\CheckoutProcessor;
@@ -274,7 +273,6 @@ class Redirect implements HttpGetActionInterface
             $products[] = [
                 'title' => $this->extractItemTitle($item),
                 'description' => $this->extractItemDescription($item),
-                'image_url' => $this->extractItemImageUrl($order, $item),
                 'quantity' => $this->extractItemQuantity($item),
                 'unit_amount' => $this->extractItemUnitAmount($item),
             ];
@@ -349,94 +347,6 @@ class Redirect implements HttpGetActionInterface
         }
 
         return null;
-    }
-
-    /**
-     * @param object $item
-     */
-    private function extractItemImageUrl(Order $order, $item): ?string
-    {
-        $imagePath = null;
-        $productType = method_exists($item, 'getProductType') ? (string) $item->getProductType() : '';
-        if ($productType === 'configurable' && method_exists($item, 'getChildrenItems')) {
-            $children = $item->getChildrenItems();
-            if (is_iterable($children)) {
-                foreach ($children as $child) {
-                    if (!is_object($child)) {
-                        continue;
-                    }
-                    $childImage = $this->productImagePath($this->safeItemProduct($child));
-                    if ($childImage !== null) {
-                        $imagePath = $childImage;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if ($imagePath === null) {
-            $imagePath = $this->productImagePath($this->safeItemProduct($item));
-        }
-
-        if ($imagePath === null) {
-            return null;
-        }
-
-        if (preg_match('/\Ahttps?:\/\//i', $imagePath) === 1) {
-            return $imagePath;
-        }
-
-        $mediaBase = $this->resolveMediaBaseUrl($order);
-        if ($mediaBase === '') {
-            return null;
-        }
-
-        return $mediaBase . '/catalog/product/' . ltrim($imagePath, '/');
-    }
-
-    /**
-     * @param object|null $product
-     */
-    private function productImagePath($product): ?string
-    {
-        if ($product === null) {
-            return null;
-        }
-
-        foreach (['getImage', 'getSmallImage', 'getThumbnail'] as $getter) {
-            if (method_exists($product, $getter)) {
-                $val = $product->$getter();
-                if (is_string($val)) {
-                    $trimmed = trim($val);
-                    if ($trimmed !== '' && $trimmed !== 'no_selection') {
-                        return $trimmed;
-                    }
-                }
-            }
-        }
-
-        return null;
-    }
-
-    private function resolveMediaBaseUrl(Order $order): string
-    {
-        if (!method_exists($order, 'getStore')) {
-            return '';
-        }
-        try {
-            $store = $order->getStore();
-            if (!is_object($store) || !method_exists($store, 'getBaseUrl')) {
-                return '';
-            }
-            $mediaType = defined(UrlInterface::class . '::URL_TYPE_MEDIA') ? UrlInterface::URL_TYPE_MEDIA : 'media';
-            $base = $store->getBaseUrl($mediaType);
-            return is_string($base) ? rtrim(trim($base), '/') : '';
-        } catch (\Throwable $e) {
-            $this->logger->warning('Paymos could not resolve store media base URL.', [
-                'error' => $e->getMessage(),
-            ]);
-            return '';
-        }
     }
 
     /**

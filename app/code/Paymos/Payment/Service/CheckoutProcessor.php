@@ -305,9 +305,6 @@ class CheckoutProcessor
             'description' => isset($candidate['description']) && is_string($candidate['description'])
                 ? $candidate['description']
                 : null,
-            'image_url' => isset($candidate['image_url']) && is_string($candidate['image_url'])
-                ? $candidate['image_url']
-                : null,
             'quantity' => array_key_exists('quantity', $candidate) ? $candidate['quantity'] : null,
             'unit_amount' => array_key_exists('unit_amount', $candidate)
                 ? $this->normalizeUnitAmountInput($candidate['unit_amount'])

@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-11-20
+
+- fix(checkout): enforce PHP SDK compatibility across CMS packages
+- refactor(checkout): remove product images from invoice products
+- chore: bundle Paymos PHP SDK v1.11.1
+- chore: rebuild canonical CMS package
+
 ## [1.12.0] - 2026-11-16
 
 - feat(plugins): add products[] to Magento 2 and Shopware 6 (9.3)

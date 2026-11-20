@@ -347,7 +347,6 @@ function test_magento_checkout_sends_single_product_and_omits_optional_fields()
             array(
                 'title' => '<b>Canvas</b> &amp; Blue',
                 'description' => '<p>Archival print</p>',
-                'image_url' => 'https://shop.example/media/catalog/product/c/a/canvas.webp',
                 'quantity' => 2,
                 'unit_amount' => '24.50',
             ),
@@ -356,6 +355,7 @@ function test_magento_checkout_sends_single_product_and_omits_optional_fields()
 
     $payload = $invoices->createPayloads[0];
     assertSameValue('47', $payload['amount'], 'Native grand total must never be replaced by sum(qty * unit_amount).');
+    assertFalseValue(array_key_exists('image_url', $payload['products'][0]), 'Product images must be absent.');
     assertSameValue(
         array(
             array(
@@ -363,7 +363,6 @@ function test_magento_checkout_sends_single_product_and_omits_optional_fields()
                 'quantity' => 2,
                 'unit_amount' => '24.50',
                 'description' => 'Archival print',
-                'image_url' => 'https://shop.example/media/catalog/product/c/a/canvas.webp',
             ),
         ),
         $payload['products'],
@@ -383,7 +382,6 @@ function test_magento_checkout_sends_single_product_and_omits_optional_fields()
             array(
                 'title' => 'Priority Support',
                 'description' => "<p>&nbsp;\xc2\xa0</p>",
-                'image_url' => 'http://shop.example/insecure.png',
                 'quantity' => '1',
                 'unit_amount' => '12.00',
             ),
@@ -399,7 +397,7 @@ function test_magento_checkout_sends_single_product_and_omits_optional_fields()
             ),
         ),
         $minimalInvoices->createPayloads[0]['products'],
-        'Blank description and non-HTTPS image_url must be omitted per item without rejecting the product.'
+        'Blank description must be omitted per item without rejecting the product.'
     );
 }
 
@@ -420,14 +418,12 @@ function test_magento_checkout_sends_cart_and_falls_back_all_or_nothing()
             array(
                 'title' => 'Canvas',
                 'description' => 'Signed print',
-                'image_url' => 'https://shop.example/canvas.png',
                 'quantity' => 2,
                 'unit_amount' => '15.00',
             ),
             array(
                 'title' => 'Notebook',
                 'description' => null,
-                'image_url' => null,
                 'quantity' => 1,
                 'unit_amount' => '12.50',
             ),
@@ -437,7 +433,7 @@ function test_magento_checkout_sends_cart_and_falls_back_all_or_nothing()
     assertSameValue('42.5', $invoices->createPayloads[0]['amount'], 'Grand total with shipping/discount/tax must be preserved.');
     assertSameValue(2, count($invoices->createPayloads[0]['products']), 'Multi-item cart must preserve all items.');
     assertFalseValue(array_key_exists('description', $invoices->createPayloads[0]['products'][1]), 'Missing description must be omitted.');
-    assertFalseValue(array_key_exists('image_url', $invoices->createPayloads[0]['products'][1]), 'Missing image_url must be omitted.');
+    assertFalseValue(array_key_exists('image_url', $invoices->createPayloads[0]['products'][1]), 'Product images must be absent.');
 
     $fifty = array();
     for ($i = 1; $i <= 50; $i++) {
@@ -521,7 +517,6 @@ function test_magento_checkout_retry_ignores_presentation_metadata_differences()
             array(
                 'title' => 'Studio Pro',
                 'description' => 'Version A',
-                'image_url' => 'https://shop.example/a.png',
                 'quantity' => 2,
                 'unit_amount' => '50.00',
             ),
@@ -538,7 +533,6 @@ function test_magento_checkout_retry_ignores_presentation_metadata_differences()
             array(
                 'title' => 'Studio Pro Updated',
                 'description' => 'Version B',
-                'image_url' => null,
                 'quantity' => 1,
                 'unit_amount' => '100.00',
             ),
@@ -594,20 +588,17 @@ function test_magento_checkout_retry_ignores_presentation_metadata_differences()
 
 function test_magento_redirect_extracts_visible_items_and_handles_fractional_fallback()
 {
-    $makeOrder = static function (array $items, string $grandTotal, string $mediaBase = 'https://shop.example/media/') {
-        return new class($items, $grandTotal, $mediaBase) extends \Magento\Sales\Model\Order {
+    $makeOrder = static function (array $items, string $grandTotal) {
+        return new class($items, $grandTotal) extends \Magento\Sales\Model\Order {
             /** @var array<int, object> */
             private $items;
             /** @var string */
             private $grandTotal;
-            /** @var string */
-            private $mediaBase;
 
-            public function __construct(array $items, string $grandTotal, string $mediaBase)
+            public function __construct(array $items, string $grandTotal)
             {
                 $this->items = $items;
                 $this->grandTotal = $grandTotal;
-                $this->mediaBase = $mediaBase;
             }
 
             public function reset() { return $this; }
@@ -630,12 +621,7 @@ function test_magento_redirect_extracts_visible_items_and_handles_fractional_fal
             public function getAllVisibleItems() { return $this->items; }
             public function getStore()
             {
-                $mediaBase = $this->mediaBase;
-                return new class($mediaBase) {
-                    private $mediaBase;
-                    public function __construct(string $mediaBase) { $this->mediaBase = $mediaBase; }
-                    public function getBaseUrl($type = 'link') { return $this->mediaBase; }
-                };
+                throw new \LogicException('Product media base URLs must not be read.');
             }
         };
     };
@@ -652,24 +638,19 @@ function test_magento_redirect_extracts_visible_items_and_handles_fractional_fal
             public function getDescription() { return $this->spec['description'] ?? null; }
             public function getQtyOrdered() { return $this->spec['qty'] ?? null; }
             public function getPrice() { return $this->spec['price'] ?? null; }
-            public function getProductType() { return $this->spec['product_type'] ?? 'simple'; }
-            public function getChildrenItems() { return $this->spec['children'] ?? array(); }
             public function getProduct()
             {
                 if (!empty($this->spec['deleted_product'])) {
                     return null;
                 }
-                $image = $this->spec['image'] ?? null;
                 $shortDesc = $this->spec['short_description'] ?? null;
-                return new class($image, $shortDesc) {
-                    private $image;
+                return new class($shortDesc) {
                     private $shortDesc;
-                    public function __construct($image, $shortDesc)
+                    public function __construct($shortDesc)
                     {
-                        $this->image = $image;
                         $this->shortDesc = $shortDesc;
                     }
-                    public function getImage() { return $this->image; }
+                    public function getImage() { throw new \LogicException('Product images must not be read.'); }
                     public function getShortDescription() { return $this->shortDesc; }
                 };
             }
@@ -732,7 +713,6 @@ function test_magento_redirect_extracts_visible_items_and_handles_fractional_fal
             'product_type' => 'configurable',
             'options' => array('attributes_info' => array(array('label' => 'Color', 'value' => 'Blue'))),
             'short_description' => '<p>Giclée print</p>',
-            'children' => array($makeItem(array('image' => '/c/a/canvas-blue.webp'))),
             'qty' => '2.0000',
             'price' => '24.5000',
         )),
@@ -761,7 +741,6 @@ function test_magento_redirect_extracts_visible_items_and_handles_fractional_fal
                 'quantity' => 2,
                 'unit_amount' => '24.50',
                 'description' => 'Giclée print',
-                'image_url' => 'https://shop.example/media/catalog/product/c/a/canvas-blue.webp',
             ),
             array(
                 'title' => 'Deleted Catalog Item',
