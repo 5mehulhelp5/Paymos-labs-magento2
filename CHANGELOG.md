@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.12.2] - 2026-11-20
+
+- chore: rebuild canonical CMS package
+
 ## [1.12.1] - 2026-11-20
 
 - fix(checkout): enforce PHP SDK compatibility across CMS packages
