@@ -24,12 +24,15 @@ final class RedirectTestOrder extends \Magento\Sales\Model\Order
     public $totalPaid = '0';
     public $saves = 0;
     public $onReload;
+    /** @var array<int, object> */
+    public $items = array();
     public function reset() { return $this; }
     public function getResource() { return $this; }
     public function load($order, $id) { if ($this->onReload) { ($this->onReload)($this); } return $this; }
     public function getState() { return $this->state; }
     public function getTotalPaid() { return $this->totalPaid; }
     public function getTotalRefunded() { return '0'; }
+    public function getAllVisibleItems() { return $this->items; }
 
     public function getId() { return 42; }
     public function getEntityId() { return 42; }
@@ -222,4 +225,43 @@ function test_magento_redirect_does_not_treat_unapplied_snapshot_as_native_payme
         assertSameValue(1, count($messages->errors), 'Buyer sees the review instruction.');
         assertFalseValue($order->cancelled, 'Review does not cancel the order.');
     }
+}
+
+function test_magento_redirect_option_suffixes_respect_200_scalar_title_budget()
+{
+    // BUG-1480: appending configurable/custom options must not push a valid base title past 200 UTF-8 scalars.
+    $base195 = str_repeat('Ж', 195);
+    $exactBase = str_repeat('Б', 193); // 193 + ' · ' (3) + 'Blue' (4) = 200 scalars
+
+    $makeItem = static function (string $name, array $options) {
+        return new class ($name, $options) {
+            private $name;
+            private $options;
+            public function __construct(string $name, array $options) { $this->name = $name; $this->options = $options; }
+            public function isDeleted() { return false; }
+            public function getParentItemId() { return null; }
+            public function getName() { return $this->name; }
+            public function getProductOptions() { return $this->options; }
+            public function getDescription() { return null; }
+            public function getQtyOrdered() { return 1; }
+            public function getPrice() { return '75.00'; }
+        };
+    };
+
+    $invoices = new FakeInvoices();
+    list($controller, $order) = paymos_m2_redirect(array(), static function () use ($invoices) {
+        return new FakeClient($invoices);
+    });
+    $order->items = array(
+        $makeItem($base195, array('attributes_info' => array(array('label' => 'Color', 'value' => 'Midnight Blue')))),
+        $makeItem($exactBase, array('options' => array(array('label' => 'Color', 'print_value' => 'Blue')))),
+    );
+
+    $result = $controller->execute();
+    assertSameValue('https://paymos.test/pay/inv_123', $result->url, 'Redirect succeeds with long-titled options.');
+    assertSameValue(1, count($invoices->createPayloads), 'One invoice created.');
+    $products = $invoices->createPayloads[0]['products'] ?? null;
+    assertTrueValue(is_array($products) && count($products) === 2, 'products[] must be preserved rather than dropped on option overflow.');
+    assertSameValue($base195, $products[0]['title'], 'Overflowing options keep the 195-scalar base title.');
+    assertSameValue($exactBase . ' · Blue', $products[1]['title'], 'Options fitting within 200 UTF-8 scalars are appended.');
 }

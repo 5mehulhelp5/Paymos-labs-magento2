@@ -319,7 +319,17 @@ class Redirect implements HttpGetActionInterface
             }
         }
 
-        return $suffixes === [] ? $name : $name . ' · ' . implode(' · ', $suffixes);
+        if ($suffixes === []) {
+            return $name;
+        }
+
+        $withOptions = $name . ' · ' . implode(' · ', $suffixes);
+        $chars = preg_split('//u', $withOptions, 201, PREG_SPLIT_NO_EMPTY);
+        if (is_array($chars) && count($chars) <= 200) {
+            return $withOptions;
+        }
+
+        return $name;
     }
 
     /**
