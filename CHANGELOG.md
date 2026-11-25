@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.12.6] - 2026-11-25
+
+- chore: rebuild canonical CMS package
+
 ## [1.12.5] - 2026-11-25
 
 - chore: bundle Paymos PHP SDK v1.13.0
