@@ -6,6 +6,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.12.5] - 2026-11-25
+
+- chore: bundle Paymos PHP SDK v1.13.0
+- chore: rebuild canonical CMS package
+
 ## [1.12.4] - 2026-11-22
 
 - fix(plugins,sdk,ci): fix PrestaShop/Shopware6/CMS locale & scalar bugs, Python webhook digits, atomic mirror pushes, token redaction, and release CI reliability (BUG-1434..1437, BUG-1461..1467, BUG-1478..1481)
